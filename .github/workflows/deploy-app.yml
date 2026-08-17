@@ -58,7 +58,7 @@ jobs:
 
       - name: Build and push immutable ARM64 image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: app
           platforms: linux/arm64
