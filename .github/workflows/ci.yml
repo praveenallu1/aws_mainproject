@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run static checks and tests
+        run: npm run lint && npm test
+
+      - name: Build container
+        run: docker build --tag cloudops-api:${{ github.sha }} .
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.3
+
+      - name: Check formatting
+        run: terraform -chdir=infrastructure fmt -check -recursive
+
+      - name: Validate bootstrap stack
+        run: |
+          terraform -chdir=infrastructure/bootstrap init -backend=false
+          terraform -chdir=infrastructure/bootstrap validate
+
+      - name: Validate workload stack
+        run: |
+          terraform -chdir=infrastructure init -backend=false
+          terraform -chdir=infrastructure validate
+

@@ -1,0 +1,139 @@
+name: Deploy application
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target GitHub/AWS environment
+        required: true
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-app-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'cloudops-capstone' }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APP_DEPLOY_ROLE_ARN }}
+          role-session-name: github-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up multi-platform builder
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve deployment names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          STACK_NAME="${PROJECT_NAME}-${{ inputs.environment }}"
+          echo "cluster=${STACK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "service=cloudops-api" >> "$GITHUB_OUTPUT"
+          echo "family=${STACK_NAME}-cloudops-api" >> "$GITHUB_OUTPUT"
+          echo "repository=${{ steps.ecr.outputs.registry }}/${STACK_NAME}/cloudops-api" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ steps.ecr.outputs.registry }}/${STACK_NAME}/cloudops-api:sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push immutable ARM64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.names.outputs.tag }}
+          provenance: true
+          sbom: true
+
+      - name: Register a new task definition
+        id: task
+        shell: bash
+        env:
+          FAMILY: ${{ steps.names.outputs.family }}
+          IMAGE: ${{ format('{0}@{1}', steps.names.outputs.repository, steps.build.outputs.digest) }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --query taskDefinition > current-task-definition.json
+          jq --arg image "$IMAGE" '
+            .containerDefinitions |= map(if .name == "cloudops-api" then .image = $image else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+          ' current-task-definition.json > new-task-definition.json
+          TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$TASK_DEFINITION_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Run database migrations as a one-off task
+        shell: bash
+        env:
+          CLUSTER: ${{ steps.names.outputs.cluster }}
+          SERVICE: ${{ steps.names.outputs.service }}
+          TASK_DEFINITION_ARN: ${{ steps.task.outputs.arn }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' > awsvpc.json
+          jq -c '{awsvpcConfiguration: .}' awsvpc.json > network-configuration.json
+          MIGRATION_TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
+            --network-configuration file://network-configuration.json \
+            --overrides '{"containerOverrides":[{"name":"cloudops-api","command":["node","src/migrate.js"]}]}' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+          test "$MIGRATION_TASK_ARN" != "None"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$MIGRATION_TASK_ARN"
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$MIGRATION_TASK_ARN" \
+            --query 'tasks[0].containers[?name==`cloudops-api`].exitCode | [0]' \
+            --output text)
+          test "$EXIT_CODE" = "0"
+
+      - name: Update service and wait for stability
+        shell: bash
+        env:
+          CLUSTER: ${{ steps.names.outputs.cluster }}
+          SERVICE: ${{ steps.names.outputs.service }}
+          TASK_DEFINITION_ARN: ${{ steps.task.outputs.arn }}
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TASK_DEFINITION_ARN" > /dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          DEPLOYED_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          test "$DEPLOYED_TASK_DEFINITION" = "$TASK_DEFINITION_ARN"

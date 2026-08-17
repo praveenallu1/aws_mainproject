@@ -1,0 +1,20 @@
+{
+  "name": "cloudops-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Operational sample service for the AWS Production Platform Capstone",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "migrate": "node src/migrate.js",
+    "test": "node --test",
+    "lint": "node --check src/server.js && node --check src/app.js && node --check src/database.js && node --check src/migrate.js"
+  },
+  "dependencies": {
+    "fastify": "5.12.0",
+    "pg": "8.16.3"
+  }
+}

@@ -1,0 +1,31 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Node
+node_modules/
+npm-debug.log*
+coverage/
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.auto.tfvars
+!*.auto.tfvars.example
+*.local.tfvars
+backend.hcl
